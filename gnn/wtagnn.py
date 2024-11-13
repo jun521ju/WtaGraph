@@ -92,6 +92,8 @@ class WTAGNNLayer(nn.Module):
     def forward(self, nf, ef):
         if self.dropout:
             nf = self.dropout(nf)
+        self.g = self.g.to(nf.device)
+        self.weight_node = self.weight_node.to(nf.device)
         self.g.ndata['nf'] = th.mm(nf, self.weight_node)
         self.g.edata['ef'] = th.mm(ef, self.weight_edge)
 

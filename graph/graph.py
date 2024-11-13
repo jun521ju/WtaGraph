@@ -33,6 +33,7 @@ class GraphLoader:
 
         #------ 2. rebuild the dgl graph
         g = dgl.DGLGraph()
+        g = g.to(args.gpu)
         g.add_nodes(len(set(src_nodes).union(set(dst_nodes))))
         g.add_edges(src_nodes, dst_nodes)
         print('Loaded graph: ', args.db_name, args.graph_name, g,'\n')
