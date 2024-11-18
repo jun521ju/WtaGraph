@@ -34,15 +34,20 @@ def performance(pred, labels, acc=None):
         str("{:.2f}".format(recall* 100) ) + '%')
     return precision, recall, tnr, tpr, f1
 
-def evaluate(model, g, nf, ef, labels, mask):
+
+def evaluate(model, g, nf, ef, e_label, edge_val_mask):
     model.eval()
-    with th.no_grad(): 
-        n_logits, e_logits = model(nf, ef)
-        e_logits = e_logits[mask]
-        labels = labels[mask]
-        _, indices = th.max(e_logits, dim=1)
-        correct = th.sum(indices == labels)
-        return correct.item() * 1.0 / len(labels), indices, labels
+    with th.no_grad():
+        # Pass g, nf, and ef to the model
+        n_logits, e_logits = model(g, nf, ef)
+
+        # Edge validation predictions and labels
+        e_predictions = e_logits[edge_val_mask].argmax(dim=1).cpu()
+        e_labels = e_label[edge_val_mask].cpu()
+
+    # Compute accuracy for edge predictions
+    acc = (e_predictions == e_labels).float().mean().item()
+    return acc, e_predictions, e_labels
 
 
 ### load the pretrained and predict some of edges in the training graph

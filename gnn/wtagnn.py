@@ -1,135 +1,108 @@
-import math
 import torch as th
 import torch.nn as nn
+import torch.nn.functional as F
 
-g = None # global dgl g
-
-def wtagnn_msg(edge):
-    nb_ef = edge.data['ef']
-    return {'nb_ef': nb_ef}
-
-def wtagnn_reduce(node):
-    nb_ef = th.mean(node.mailbox['nb_ef'], 1) 
-    return {'nb_ef': nb_ef}
-
-class NodeApplyModule(nn.Module):
-    def __init__(self, out_feats, activation=None, bias=True):
-        super(NodeApplyModule, self).__init__()
-        if bias:
-            self.bias = nn.Parameter(th.Tensor(out_feats))
-        else:
-            self.bias = None
+class GATLayer(nn.Module):
+    def __init__(self, in_feats_node, in_feats_edge, out_feats, num_heads=1, activation=None, dropout=0.0, bias=True):
+        super(GATLayer, self).__init__()
+        self.in_feats_node = in_feats_node
+        self.in_feats_edge = in_feats_edge
+        self.out_feats = out_feats
+        self.num_heads = num_heads
         self.activation = activation
-        self.reset_parameters()
+        self.dropout = nn.Dropout(dropout) if dropout else None
 
-    def reset_parameters(self):
-        if self.bias is not None:
-            stdv = 1. / math.sqrt(self.bias.size(0))
-            self.bias.data.uniform_(-stdv, stdv)
+        # Linear transformations for multi-head attention
+        self.fc_node = nn.Linear(in_feats_node, out_feats * num_heads, bias=False)
+        self.fc_edge = nn.Linear(in_feats_edge, out_feats * num_heads, bias=False)
 
-    def forward(self, nodes):
-        nf = nodes.data['nf']
-        nb_ef = nodes.data['nb_ef']
+        # Attention weights
+        self.attn_l = nn.Parameter(th.FloatTensor(size=(num_heads, out_feats)))
+        self.attn_r = nn.Parameter(th.FloatTensor(size=(num_heads, out_feats)))
+        self.attn_e = nn.Parameter(th.FloatTensor(size=(num_heads, out_feats)))
 
-        if self.bias is not None:
-            nf = nf + self.bias
-        if self.activation:
-            nf = self.activation(nf)
-        return {'nf': nf, 'nb_ef': nb_ef}
-
-class EdgeApplyModule(nn.Module):
-    def __init__(self, out_feats, activation=None, bias=True):
-        super(EdgeApplyModule, self).__init__()
+        # Bias term
         if bias:
-            self.bias = nn.Parameter(th.Tensor(out_feats))
+            self.bias = nn.Parameter(th.FloatTensor(size=(num_heads * out_feats,)))
         else:
-            self.bias = None
-        self.activation = activation
+            self.register_parameter('bias', None)
+
         self.reset_parameters()
-        self.my_dense = nn.Linear(out_feats * 2, out_feats)
+
 
     def reset_parameters(self):
+        nn.init.xavier_normal_(self.fc_node.weight)
+        nn.init.xavier_normal_(self.fc_edge.weight)
+        nn.init.xavier_normal_(self.attn_l)
+        nn.init.xavier_normal_(self.attn_r)
+        nn.init.xavier_normal_(self.attn_e)
         if self.bias is not None:
-            stdv = 1. / math.sqrt(self.bias.size(0))
-            self.bias.data.uniform_(-stdv, stdv)
+            nn.init.constant_(self.bias, 0)
 
-    def forward(self, edges):
-        ### msg pass strategy: ef = ef + nb_ef + srcdst_nf
-        tmp_ef =  edges.data['ef'] + edges.dst['nb_ef'] # mean/max-fy at msg_reduce
-        srcdst_nf = (edges.src['nf'] + edges.dst['nf']) / 2  
-        ef = self.my_dense(th.cat([tmp_ef, srcdst_nf], 1))    
-        
+    def edge_attention(self, edges):
+        # Compute unnormalized attention scores for each head
+        el = (edges.src['z'] * self.attn_l).sum(dim=-1)  # Shape: (E, H)
+        er = (edges.dst['z'] * self.attn_r).sum(dim=-1)  # Shape: (E, H)
+        z_e = edges.data['z_e'].clone()  # Clone to avoid in-place conflicts
+        ee = (z_e * self.attn_e).sum(dim=-1)  # Use cloned tensor
+
+        # Combine attention scores
+        e = F.leaky_relu(el + er + ee)  # Shape: (E, H)
+        print(f"el shape: {el.shape}, er shape: {er.shape}, ee shape: {ee.shape}, e shape: {e.shape}")
+        return {'e': e}
+
+
+    def message_func(self, edges):
+        return {'z': edges.src['z'], 'e': edges.data['e'], 'z_e': edges.data['z_e']}
+
+
+    def reduce_func(self, nodes):
+        alpha = F.softmax(nodes.mailbox['e'], dim=1)
+        h = th.sum(alpha.unsqueeze(-1) * nodes.mailbox['z'], dim=1)
+        return {'h': h}
+
+
+    def forward(self, g, nf, ef):
+        z = self.fc_node(nf).view(-1, self.num_heads, self.out_feats)
+        z_e = self.fc_edge(ef).view(-1, self.num_heads, self.out_feats)
+        g.ndata['z'] = z
+        g.edata['z_e'] = z_e
+
+        g.apply_edges(self.edge_attention)
+        g.update_all(self.message_func, self.reduce_func)
+
+        n_out = g.ndata.pop('h').view(-1, self.num_heads * self.out_feats)
+        e_out = g.edata.pop('z_e').view(-1, self.num_heads * self.out_feats)
+
         if self.bias is not None:
-            ef = ef + self.bias
+            n_out += self.bias.unsqueeze(0)
+            e_out += self.bias.unsqueeze(0)
+
         if self.activation:
-            ef = self.activation(ef)
+            n_out = self.activation(n_out)
+            e_out = self.activation(e_out)
 
-        return {'ef': ef}
-
-class WTAGNNLayer(nn.Module):
-    def __init__(self, g, in_feats_node, in_feats_edge, out_feats, activation,
-                 dropout, bias=True):
-        super(WTAGNNLayer, self).__init__()
-        self.g = g
-        self.weight_node = nn.Parameter(th.Tensor(in_feats_node, out_feats))
-        self.weight_edge = nn.Parameter(th.Tensor(in_feats_edge, out_feats))
-        if dropout:
-            self.dropout = nn.Dropout(p=dropout)
-        else:
-            self.dropout = 0.
-        self.node_update = NodeApplyModule(out_feats, activation, bias)
-        self.edge_update = EdgeApplyModule(out_feats, activation, bias)
-        self.reset_parameters()
-        self.PRINT = False
-
-    def reset_parameters(self):
-        stdv = 1. / math.sqrt(self.weight_node.size(1))
-        self.weight_node.data.uniform_(-stdv, stdv)
-
-        stdv_edge = 1. / math.sqrt(self.weight_edge.size(1))
-        self.weight_edge.data.uniform_(-stdv_edge, stdv_edge)
-
-    def forward(self, nf, ef):
         if self.dropout:
-            nf = self.dropout(nf)
-        self.g = self.g.to(nf.device)
-        self.weight_node = self.weight_node.to(nf.device)
-        self.g.ndata['nf'] = th.mm(nf, self.weight_node)
-        self.g.edata['ef'] = th.mm(ef, self.weight_edge)
+            n_out = self.dropout(n_out)
+            e_out = self.dropout(e_out)
 
-        if self.PRINT: print('After mm, nf: ', self.g.ndata['nf'])
-        if self.PRINT: print('After mm, ef: ', self.g.edata['ef'])
+        return n_out, e_out
 
-        global g
-        g = self.g
-        self.g.update_all(wtagnn_msg, wtagnn_reduce)
-
-        if self.PRINT: print('After update_all, nf: ', self.g.ndata['nf'])
-        if self.PRINT: print('After update_all, nb_ef: ', self.g.ndata['nb_ef'])
-        if self.PRINT: print('After update_all, ef: ', self.g.edata['ef'])
-        self.g.apply_nodes(func=self.node_update)
-
-        self.g.apply_edges(func=self.edge_update)
-        if self.PRINT: print('After apply_nodes, nf: ', self.g.ndata['nf'])
-        if self.PRINT: print('After apply_nodes, nb_ef: ', self.g.ndata['nb_ef'])
-        if self.PRINT: print('After apply_edges, ef: ', self.g.edata['ef'])
-
-        nf = self.g.ndata.pop('nf')
-        ef = self.g.edata.pop('ef')
-        self.g.ndata.pop('nb_ef')
-        return nf, ef
 
 class WTAGNN(nn.Module):
-    def __init__(self, g,  input_node_feat_size, input_edge_feat_size, n_hidden, n_classes,
-                 n_layers,  activation, dropout):
+    def __init__(self, g, input_node_feat_size, input_edge_feat_size, n_hidden, n_classes,
+                 n_layers, n_heads, activation, dropout):
         super(WTAGNN, self).__init__()
         self.layers = nn.ModuleList()
-        self.layers.append(WTAGNNLayer(g, input_node_feat_size, input_edge_feat_size, n_hidden, activation, dropout))
-        for i in range(n_layers - 1):
-            self.layers.append(WTAGNNLayer(g, n_hidden, n_hidden, n_hidden, activation, dropout))
-        self.layers.append(WTAGNNLayer(g, n_hidden, n_hidden, n_classes, None, dropout))
+        self.layers.append(GATLayer(input_node_feat_size, input_edge_feat_size, n_hidden, n_heads, activation, dropout))
+        for _ in range(n_layers - 1):
+            self.layers.append(GATLayer(n_hidden * n_heads, n_hidden * n_heads, n_hidden, n_heads, activation, dropout))
+        self.node_out_layer = GATLayer(n_hidden * n_heads, n_hidden * n_heads, n_classes, num_heads=1, activation=None, dropout=dropout)
+        self.edge_out_layer = nn.Linear(n_hidden * n_heads, n_classes)
 
-    def forward(self, nf, ef):
+    def forward(self, g, nf, ef):
         for layer in self.layers:
-            nf, ef = layer(nf, ef)
-        return nf, ef
+            nf, ef = layer(g, nf, ef)
+        n_logits, _ = self.node_out_layer(g, nf, ef)
+        e_logits = self.edge_out_layer(ef)
+        return n_logits, e_logits

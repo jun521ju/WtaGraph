@@ -3,6 +3,15 @@ import dgl
 import torch as th
 import numpy as np
 import pickle
+from sklearn.decomposition import PCA
+
+
+def preprocess_edge_features(ef, target_dim):
+    ef_np = ef.numpy()  # Convert to NumPy array for PCA
+    pca = PCA(n_components=target_dim)
+    ef_reduced = pca.fit_transform(ef_np)
+    return th.from_numpy(ef_reduced)  # Convert back to PyTorch tensor
+
 
 class GraphLoader:
     def __init__(self):
@@ -19,41 +28,47 @@ class GraphLoader:
 
         return id_node_map, id_edge_map
 
+
     def load_graph(self, args):
         print('\n************loading the specified graph and feature data************')
-        #------ 1. load graph.edgelist to rebuild the graph
+        # Load the graph
         edgelist_path = './data/graph_data/' + args.db_name + '/' + args.graph_name + '_graph.edgelist'
         with open(edgelist_path, 'r') as f:
-            edges = [tuple(line.strip().split(',')) for line in f]
-            #format: e.g. 26,5350,3982
-        edges = [tuple((int(e[0]), int(e[1]), int(e[2]))) for e in edges]
+            edges = [tuple(map(int, line.strip().split(','))) for line in f]
+
         src_nodes = [e[1] for e in edges]
         dst_nodes = [e[2] for e in edges]
-        # print("edges", len(edges), 'src_nodes', len(set(src_nodes)), 'dst_nodes', len(set(dst_nodes)))
 
-        #------ 2. rebuild the dgl graph
+        # Rebuild the graph
         g = dgl.DGLGraph()
         g = g.to(args.gpu)
         g.add_nodes(len(set(src_nodes).union(set(dst_nodes))))
         g.add_edges(src_nodes, dst_nodes)
-        print('Loaded graph: ', args.db_name, args.graph_name, g,'\n')
+        print('Loaded graph: ', args.db_name, args.graph_name, g, '\n')
 
-        #------ 3. load node feature
-        nf = np.load('./data/feat_data/'  + args.db_name + '/' + args.graph_name + '_node_feat.npy')
+        # Load node features
+        nf = np.load('./data/feat_data/' + args.db_name + '/' + args.graph_name + '_node_feat.npy')
         nf = th.from_numpy(nf)
-        print('node feature shape:', nf.shape)
-        
-        #------ 4. load edge feature
-        ef = np.load('./data/feat_data/'  + args.db_name + '/' + args.graph_name + '_edge_feat.npy')
+        print('Node feature shape:', nf.shape)
+
+        # Load edge features
+        ef = np.load('./data/feat_data/' + args.db_name + '/' + args.graph_name + '_edge_feat.npy')
         ef = th.from_numpy(ef)
-        print('edge feature shape:', ef.shape)
+        print('Original edge feature shape:', ef.shape)
 
-        #------ 5. load edge label
-        e_label = np.load('./data/feat_data/'  + args.db_name + '/' + args.graph_name + '_edge_label.npy').tolist()
+        # Apply PCA preprocessing if needed
+        target_dim = 80  # Adjust to match expected input_edge_feat_size
+        print("Calling preprocess_edge_features...")
+        ef = preprocess_edge_features(ef, target_dim)
+        print("Edge features processed successfully.")
+        print('Reduced edge feature shape:', ef.shape)
+
+        # Load edge labels
+        e_label = np.load('./data/feat_data/' + args.db_name + '/' + args.graph_name + '_edge_label.npy').tolist()
         e_label = th.tensor(e_label)
-        print('edge labels shape:', e_label.shape)
+        print('Edge labels shape:', e_label.shape)
 
-        #------ 6. prepare train test val mask
+        # Prepare train, test, and validation masks
         train_mask, test_mask, val_mask = self._split_dataset(e_label, (args.r_train, args.r_test, args.r_val))
 
         print('***************************loading completed***************************\n')
