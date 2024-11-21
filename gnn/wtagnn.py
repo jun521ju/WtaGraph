@@ -16,9 +16,6 @@ class GATLayer(nn.Module):
         self.fc_node = nn.Linear(in_feats_node, out_feats * num_heads, bias=False)
         self.fc_edge = nn.Linear(in_feats_edge, out_feats * num_heads, bias=False)  # Replaced MLP with a single linear layer
 
-        # Debugging shapes
-        print(f"Initialized fc_edge with in_feats_edge={in_feats_edge}, out_feats={out_feats}, num_heads={num_heads}")
-
         # Attention weights
         self.attn_l = nn.Parameter(th.FloatTensor(size=(num_heads, out_feats)))
         self.attn_r = nn.Parameter(th.FloatTensor(size=(num_heads, out_feats)))
@@ -89,8 +86,6 @@ class GATLayer(nn.Module):
         z = self.fc_node(nf).view(-1, self.num_heads, self.out_feats)  # Node features: [num_nodes, num_heads, out_feats]
         z_e = self.fc_edge(ef).view(-1, self.num_heads, self.out_feats)  # Updated to use fc_edge
 
-        print("Shape of z_e after fc_edge:", z_e.shape)
-
         g.ndata['z'] = z
         g.edata['z_e'] = z_e
 
@@ -146,14 +141,8 @@ class WTAGNN(nn.Module):
         # Compute node logits and updated edge features
         n_logits, ef = self.node_out_layer(g, nf, ef)
 
-        # Debugging dimensions
-        print(f"ef shape after node_out_layer: {ef.shape}")
-
         # Transform edge features to match edge_out_layer input requirements
         ef = self.edge_transform_layer(ef.view(-1, ef.size(-1)))
-
-        # Debugging dimensions after transformation
-        print(f"ef shape after edge_transform_layer: {ef.shape}")
 
         # Compute edge logits
         e_logits = self.edge_out_layer(ef)
