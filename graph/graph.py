@@ -10,6 +10,7 @@ def preprocess_edge_features(ef, target_dim):
     ef_np = ef.numpy()  # Convert to NumPy array for PCA
     pca = PCA(n_components=target_dim)
     ef_reduced = pca.fit_transform(ef_np)
+    print(f"Reduced edge features shape after PCA: {ef_reduced.shape}")
     return th.from_numpy(ef_reduced)  # Convert back to PyTorch tensor
 
 
