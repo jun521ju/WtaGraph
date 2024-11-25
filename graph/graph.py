@@ -29,9 +29,9 @@ class GraphLoader:
 
         return id_node_map, id_edge_map
 
-
     def load_graph(self, args):
         print('\n************loading the specified graph and feature data************')
+
         # Load the graph
         edgelist_path = './data/graph_data/' + args.db_name + '/' + args.graph_name + '_graph.edgelist'
         with open(edgelist_path, 'r') as f:
@@ -55,14 +55,7 @@ class GraphLoader:
         # Load edge features
         ef = np.load('./data/feat_data/' + args.db_name + '/' + args.graph_name + '_edge_feat.npy')
         ef = th.from_numpy(ef)
-        print('Original edge feature shape:', ef.shape)
-
-        # Apply PCA preprocessing if needed
-        target_dim = 80  # Adjust to match expected input_edge_feat_size
-        print("Calling preprocess_edge_features...")
-        ef = preprocess_edge_features(ef, target_dim)
-        print("Edge features processed successfully.")
-        print('Reduced edge feature shape:', ef.shape)
+        print('Edge feature shape:', ef.shape)
 
         # Load edge labels
         e_label = np.load('./data/feat_data/' + args.db_name + '/' + args.graph_name + '_edge_label.npy').tolist()
@@ -75,7 +68,7 @@ class GraphLoader:
         print('***************************loading completed***************************\n')
         return g, nf, ef, e_label, train_mask, test_mask, val_mask
 
-    def _split_dataset(self, labels, ratio_tuple):   
+    def _split_dataset(self, labels, ratio_tuple):
         shuffle_list = [i for i in range(labels.shape[0])]
         random.shuffle(shuffle_list)
         train_ct = int(len(shuffle_list) * ratio_tuple[0])

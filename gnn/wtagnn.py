@@ -121,13 +121,15 @@ class WTAGNN(nn.Module):
         # Input layer
         self.layers = nn.ModuleList()
         self.layers.append(GATLayer(input_node_feat_size, input_edge_feat_size, n_hidden, n_heads, activation, dropout))
+
         # Hidden layers
         for _ in range(n_layers - 1):
             self.layers.append(GATLayer(n_hidden * n_heads, n_hidden * n_heads, n_hidden, n_heads, activation, dropout))
+
         # Output layers
         self.node_out_layer = GATLayer(n_hidden * n_heads, n_hidden * n_heads, n_classes, num_heads=1, activation=None,
                                        dropout=dropout)
-        self.edge_transform_layer = nn.Linear(n_classes, n_hidden * n_heads)  # New layer to transform ef
+        self.edge_transform_layer = nn.Linear(n_classes, n_hidden * n_heads)  # Transform layer for edge features
         self.edge_out_layer = nn.Linear(n_hidden * n_heads, n_classes)
 
     def forward(self, g, nf, ef):
