@@ -1,133 +1,153 @@
-import math
 import torch as th
 import torch.nn as nn
+import torch.nn.functional as F
 
-g = None # global dgl g
-
-def wtagnn_msg(edge):
-    nb_ef = edge.data['ef']
-    return {'nb_ef': nb_ef}
-
-def wtagnn_reduce(node):
-    nb_ef = th.mean(node.mailbox['nb_ef'], 1) 
-    return {'nb_ef': nb_ef}
-
-class NodeApplyModule(nn.Module):
-    def __init__(self, out_feats, activation=None, bias=True):
-        super(NodeApplyModule, self).__init__()
-        if bias:
-            self.bias = nn.Parameter(th.Tensor(out_feats))
-        else:
-            self.bias = None
+class GATLayer(nn.Module):
+    def __init__(self, in_feats_node, in_feats_edge, out_feats, num_heads=1, activation=None, dropout=0.0, bias=True):
+        super(GATLayer, self).__init__()
+        self.in_feats_node = in_feats_node
+        self.in_feats_edge = in_feats_edge
+        self.out_feats = out_feats
+        self.num_heads = num_heads
         self.activation = activation
-        self.reset_parameters()
+        self.dropout = nn.Dropout(dropout) if dropout else None
 
-    def reset_parameters(self):
-        if self.bias is not None:
-            stdv = 1. / math.sqrt(self.bias.size(0))
-            self.bias.data.uniform_(-stdv, stdv)
+        # Linear transformations for multi-head attention
+        self.fc_node = nn.Linear(in_feats_node, out_feats * num_heads, bias=False)
+        self.fc_edge = nn.Linear(in_feats_edge, out_feats * num_heads, bias=False)  # Replaced MLP with a single linear layer
 
-    def forward(self, nodes):
-        nf = nodes.data['nf']
-        nb_ef = nodes.data['nb_ef']
+        # Attention weights
+        self.attn_l = nn.Parameter(th.FloatTensor(size=(num_heads, out_feats)))
+        self.attn_r = nn.Parameter(th.FloatTensor(size=(num_heads, out_feats)))
+        self.attn_e = nn.Parameter(th.FloatTensor(size=(num_heads, out_feats)))
 
-        if self.bias is not None:
-            nf = nf + self.bias
-        if self.activation:
-            nf = self.activation(nf)
-        return {'nf': nf, 'nb_ef': nb_ef}
+        # Learnable edge weights
+        self.edge_weights = nn.Parameter(th.Tensor(out_feats * num_heads, out_feats * num_heads))
+        nn.init.xavier_uniform_(self.edge_weights)
 
-class EdgeApplyModule(nn.Module):
-    def __init__(self, out_feats, activation=None, bias=True):
-        super(EdgeApplyModule, self).__init__()
+        # Bias term
         if bias:
-            self.bias = nn.Parameter(th.Tensor(out_feats))
+            self.bias = nn.Parameter(th.FloatTensor(size=(num_heads * out_feats,)))
         else:
-            self.bias = None
-        self.activation = activation
+            self.register_parameter('bias', None)
+
         self.reset_parameters()
-        self.my_dense = nn.Linear(out_feats * 2, out_feats)
 
     def reset_parameters(self):
+        nn.init.xavier_normal_(self.fc_node.weight)
+        nn.init.xavier_normal_(self.fc_edge.weight)  # Updated initialization for the single linear layer
+        nn.init.xavier_normal_(self.attn_l)
+        nn.init.xavier_normal_(self.attn_r)
+        nn.init.xavier_normal_(self.attn_e)
+        nn.init.xavier_uniform_(self.edge_weights)
         if self.bias is not None:
-            stdv = 1. / math.sqrt(self.bias.size(0))
-            self.bias.data.uniform_(-stdv, stdv)
+            nn.init.constant_(self.bias, 0)
 
-    def forward(self, edges):
-        ### msg pass strategy: ef = ef + nb_ef + srcdst_nf
-        tmp_ef =  edges.data['ef'] + edges.dst['nb_ef'] # mean/max-fy at msg_reduce
-        srcdst_nf = (edges.src['nf'] + edges.dst['nf']) / 2  
-        ef = self.my_dense(th.cat([tmp_ef, srcdst_nf], 1))    
-        
+    def edge_attention(self, edges):
+        """
+        Computes unnormalized attention scores based on nodes and edge features.
+        """
+        # Compute attention from source and destination nodes
+        el = (edges.src['z'] * self.attn_l).sum(dim=-1)  # (E, H)
+        er = (edges.dst['z'] * self.attn_r).sum(dim=-1)  # (E, H)
+
+        # Transform edge features to align dimensions
+        transformed_z_e = edges.data['z_e'].view(-1, self.out_feats * self.num_heads)
+
+        # Use learnable edge weights
+        weighted_z_e = transformed_z_e @ self.edge_weights.T
+        weighted_z_e = weighted_z_e.view(-1, self.num_heads, self.out_feats)
+        ee = (weighted_z_e * self.attn_e).sum(dim=-1)  # (E, H)
+
+        # Aggregate attention scores
+        e = F.leaky_relu(el + er + ee)  # (E, H)
+
+        return {'e': e}
+
+    def message_func(self, edges):
+        """
+        Sends messages along the edges during the message-passing phase.
+        """
+        return {'z': edges.src['z'], 'e': edges.data['e'], 'z_e': edges.data['z_e']}
+
+    def reduce_func(self, nodes):
+        """
+        Reduces incoming messages at each node using attention scores.
+        """
+        alpha = F.softmax(nodes.mailbox['e'], dim=1)  # Compute attention weights
+        h = th.sum(alpha.unsqueeze(-1) * nodes.mailbox['z'], dim=1)  # Weighted sum of messages
+        return {'h': h}
+
+    def forward(self, g, nf, ef):
+        # Ensure ef has correct shape
+        ef = ef.view(-1, self.in_feats_edge)
+
+        # Transform node and edge features
+        z = self.fc_node(nf).view(-1, self.num_heads, self.out_feats)  # Node features: [num_nodes, num_heads, out_feats]
+        z_e = self.fc_edge(ef).view(-1, self.num_heads, self.out_feats)  # Updated to use fc_edge
+
+        g.ndata['z'] = z
+        g.edata['z_e'] = z_e
+
+        # Apply attention mechanism
+        g.apply_edges(self.edge_attention)
+        g.update_all(self.message_func, self.reduce_func)
+
+        # Node and edge outputs
+        n_out = g.ndata.pop('h').view(-1, self.num_heads * self.out_feats)
+        e_out = g.edata.pop('z_e').view(-1, self.num_heads * self.out_feats)
+
+        # Combine node and edge features
+        g.edata['z_e'] = e_out.view(-1, self.num_heads, self.out_feats)
+        g.apply_edges(lambda edges: {'fused': edges.src['z'] + edges.data['z_e']})
+        fused_out = g.edata.pop('fused')
+
+        # Optional: Apply bias, activation, and dropout
         if self.bias is not None:
-            ef = ef + self.bias
+            reshaped_bias = self.bias.view(self.num_heads, self.out_feats).unsqueeze(0)  # Align dimensions
+            fused_out += reshaped_bias
         if self.activation:
-            ef = self.activation(ef)
-
-        return {'ef': ef}
-
-class WTAGNNLayer(nn.Module):
-    def __init__(self, g, in_feats_node, in_feats_edge, out_feats, activation,
-                 dropout, bias=True):
-        super(WTAGNNLayer, self).__init__()
-        self.g = g
-        self.weight_node = nn.Parameter(th.Tensor(in_feats_node, out_feats))
-        self.weight_edge = nn.Parameter(th.Tensor(in_feats_edge, out_feats))
-        if dropout:
-            self.dropout = nn.Dropout(p=dropout)
-        else:
-            self.dropout = 0.
-        self.node_update = NodeApplyModule(out_feats, activation, bias)
-        self.edge_update = EdgeApplyModule(out_feats, activation, bias)
-        self.reset_parameters()
-        self.PRINT = False
-
-    def reset_parameters(self):
-        stdv = 1. / math.sqrt(self.weight_node.size(1))
-        self.weight_node.data.uniform_(-stdv, stdv)
-
-        stdv_edge = 1. / math.sqrt(self.weight_edge.size(1))
-        self.weight_edge.data.uniform_(-stdv_edge, stdv_edge)
-
-    def forward(self, nf, ef):
+            fused_out = self.activation(fused_out)
         if self.dropout:
-            nf = self.dropout(nf)
-        self.g.ndata['nf'] = th.mm(nf, self.weight_node)
-        self.g.edata['ef'] = th.mm(ef, self.weight_edge)
+            fused_out = self.dropout(fused_out)
 
-        if self.PRINT: print('After mm, nf: ', self.g.ndata['nf'])
-        if self.PRINT: print('After mm, ef: ', self.g.edata['ef'])
+        return n_out, fused_out
 
-        global g
-        g = self.g
-        self.g.update_all(wtagnn_msg, wtagnn_reduce)
-
-        if self.PRINT: print('After update_all, nf: ', self.g.ndata['nf'])
-        if self.PRINT: print('After update_all, nb_ef: ', self.g.ndata['nb_ef'])
-        if self.PRINT: print('After update_all, ef: ', self.g.edata['ef'])
-        self.g.apply_nodes(func=self.node_update)
-
-        self.g.apply_edges(func=self.edge_update)
-        if self.PRINT: print('After apply_nodes, nf: ', self.g.ndata['nf'])
-        if self.PRINT: print('After apply_nodes, nb_ef: ', self.g.ndata['nb_ef'])
-        if self.PRINT: print('After apply_edges, ef: ', self.g.edata['ef'])
-
-        nf = self.g.ndata.pop('nf')
-        ef = self.g.edata.pop('ef')
-        self.g.ndata.pop('nb_ef')
-        return nf, ef
 
 class WTAGNN(nn.Module):
-    def __init__(self, g,  input_node_feat_size, input_edge_feat_size, n_hidden, n_classes,
-                 n_layers,  activation, dropout):
+    def __init__(self, g, input_node_feat_size, input_edge_feat_size, n_hidden, n_classes,
+                 n_layers, n_heads, activation, dropout):
         super(WTAGNN, self).__init__()
+        # Input layer
         self.layers = nn.ModuleList()
-        self.layers.append(WTAGNNLayer(g, input_node_feat_size, input_edge_feat_size, n_hidden, activation, dropout))
-        for i in range(n_layers - 1):
-            self.layers.append(WTAGNNLayer(g, n_hidden, n_hidden, n_hidden, activation, dropout))
-        self.layers.append(WTAGNNLayer(g, n_hidden, n_hidden, n_classes, None, dropout))
+        self.layers.append(GATLayer(input_node_feat_size, input_edge_feat_size, n_hidden, n_heads, activation, dropout))
 
-    def forward(self, nf, ef):
+        # Hidden layers
+        for _ in range(n_layers - 1):
+            self.layers.append(GATLayer(n_hidden * n_heads, n_hidden * n_heads, n_hidden, n_heads, activation, dropout))
+
+        # Output layers
+        self.node_out_layer = GATLayer(n_hidden * n_heads, n_hidden * n_heads, n_classes, num_heads=1, activation=None,
+                                       dropout=dropout)
+        self.edge_transform_layer = nn.Linear(n_classes, n_hidden * n_heads)  # Transform layer for edge features
+        self.edge_out_layer = nn.Linear(n_hidden * n_heads, n_classes)
+
+    def forward(self, g, nf, ef):
+        """
+        Forward pass for the WTAGNN model.
+        Processes graph layers sequentially and computes outputs for nodes and edges.
+        """
         for layer in self.layers:
-            nf, ef = layer(nf, ef)
-        return nf, ef
+            nf, ef = layer(g, nf, ef)
+
+        # Compute node logits and updated edge features
+        n_logits, ef = self.node_out_layer(g, nf, ef)
+
+        # Transform edge features to match edge_out_layer input requirements
+        ef = self.edge_transform_layer(ef.view(-1, ef.size(-1)))
+
+        # Compute edge logits
+        e_logits = self.edge_out_layer(ef)
+
+        return n_logits, e_logits
+

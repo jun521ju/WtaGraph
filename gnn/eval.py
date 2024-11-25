@@ -34,33 +34,55 @@ def performance(pred, labels, acc=None):
         str("{:.2f}".format(recall* 100) ) + '%')
     return precision, recall, tnr, tpr, f1
 
-def evaluate(model, g, nf, ef, labels, mask):
+
+def evaluate(model, g, nf, ef, e_label, edge_val_mask):
     model.eval()
-    with th.no_grad(): 
-        n_logits, e_logits = model(nf, ef)
-        e_logits = e_logits[mask]
-        labels = labels[mask]
-        _, indices = th.max(e_logits, dim=1)
-        correct = th.sum(indices == labels)
-        return correct.item() * 1.0 / len(labels), indices, labels
+    with th.no_grad():
+        # Move nf and ef to the same device as the graph
+        device = g.device
+        nf = nf.to(device)
+        ef = ef.to(device)
+
+        # Pass g, nf, and ef to the model
+        n_logits, e_logits = model(g, nf, ef)
+
+        # Edge validation predictions and labels
+        e_predictions = e_logits[edge_val_mask].argmax(dim=1).cpu()
+        e_labels = e_label[edge_val_mask].cpu()
+
+    # Compute accuracy for edge predictions
+    acc = (e_predictions == e_labels).float().mean().item()
+    return acc, e_predictions, e_labels
 
 
 ### load the pretrained and predict some of edges in the training graph
 ### for testing purpose only
 def eval_saved_model(args):
     gloader = GraphLoader()
-    if args.g_to_merge is not None: #load two graph and merge together
-        g, nf, ef, e_label, train_mask, test_mask, val_mask = gloader.load_and_merge_graph(args)  
-    else: # eval the model on the same graph used for training
-        g, nf, ef, e_label, train_mask, test_mask, val_mask = gloader.load_graph(args)  
+    if args.g_to_merge is not None:  # load two graph and merge together
+        g, nf, ef, e_label, train_mask, test_mask, val_mask = gloader.load_and_merge_graph(args)
+    else:  # eval the model on the same graph used for training
+        g, nf, ef, e_label, train_mask, test_mask, val_mask = gloader.load_graph(args)
 
     n_classes = 2
     input_node_feat_size, input_edge_feat_size = nf.shape[1], ef.shape[1]
 
-    # load the pre-trained model
-    best_model = WTAGNN(g, input_node_feat_size, input_edge_feat_size, args.n_hidden, n_classes, args.n_layers,  F.relu, args.dropout)
-    best_model.load_state_dict(th.load( './output/best.model.' + args.model_name))
-    print('model load from: ./output/best.model.' + args.model_name )
+    # Load the pre-trained model
+    best_model = WTAGNN(
+        g, input_node_feat_size, input_edge_feat_size,
+        args.n_hidden, n_classes, args.n_layers, args.n_heads, F.relu, args.dropout
+    )
+    best_model.load_state_dict(th.load('./output/best.model.' + args.model_name))
+    print('model load from: ./output/best.model.' + args.model_name)
+
+    # Move graph, features, and model to the appropriate device
+    if args.gpu >= 0:
+        device = f'cuda:{args.gpu}'
+        g = g.to(device)
+        nf = nf.to(device)
+        ef = ef.to(device)
+        e_label = e_label.to(device)
+        best_model = best_model.to(device)
 
     acc, predictions, labels = evaluate(best_model, g, nf, ef, e_label, test_mask)
     precision, recall, tnr, tpr, f1 = performance(predictions.tolist(), labels.tolist(), acc)
@@ -71,9 +93,18 @@ def eval_saved_model(args):
 ### we next apply the trained model to the testing graph and predict those edges that never seen before during training
 def eval_model_inductive(args):
     gloader = GraphLoader()
-    ### load the training graph
-    train_g, train_g_nf, train_g_ef, train_g_e_label, _, _, _ = gloader.load_graph(args)  
+
+    ### Load the training graph
+    train_g, train_g_nf, train_g_ef, train_g_e_label, _, _, _ = gloader.load_graph(args)
     train_g_id_node_map, train_g_id_edge_map = gloader.load_node_edge_map(args)
+
+    # Move training graph to GPU if specified
+    if args.gpu >= 0:
+        train_g = train_g.to(f'cuda:{args.gpu}')
+        train_g_nf = train_g_nf.cuda(args.gpu)
+        train_g_ef = train_g_ef.cuda(args.gpu)
+        train_g_e_label = train_g_e_label.cuda(args.gpu)
+
     train_g.ndata['nf'], train_g.edata['ef'], train_g.edata['e_label'] = train_g_nf, train_g_ef, train_g_e_label
 
     ### load the full graph, where we have all testing edges from all testing sites
@@ -84,6 +115,14 @@ def eval_model_inductive(args):
     args.graph_name = 'full' #set it to full so that we can load the full graph; it was set to the train_g orginally
     full_g, full_g_nf, full_g_ef, full_g_e_label, _, _, _ = gloader.load_graph(args)  
     full_g_id_node_map, full_g_id_edge_map = gloader.load_node_edge_map(args)
+
+    # Move full graph to GPU if specified
+    if args.gpu >= 0:
+        full_g = full_g.to(f'cuda:{args.gpu}')
+        full_g_nf = full_g_nf.cuda(args.gpu)
+        full_g_ef = full_g_ef.cuda(args.gpu)
+        full_g_e_label = full_g_e_label.cuda(args.gpu)
+
     full_g.ndata['nf'], full_g.edata['ef'], full_g.edata['e_label'] = full_g_nf, full_g_ef, full_g_e_label
 
     train_g_node_id_map = {v: k for k, v in train_g_id_node_map.items()}
